@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# Test Data
 test_images/
+lora*
+my_lora_weights/
 
-lora* 
+# Mac
+.DS_Store
