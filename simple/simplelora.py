@@ -1,15 +1,21 @@
 import torch
 import torch.nn.functional as F
 from torch import nn, optim
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import (
+        AutoencoderKL,
+        StableDiffusionPipeline,
+        DiffusionPipeline,
+        UNet2DConditionModel,
+        DDPMScheduler,
+)
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import free_memory
+from transformers import AutoTokenizer, CLIPTextModel
 from peft import LoraConfig, get_peft_model
-from datasets import load_dataset
 import random
 from PIL import Image
 import os
 from dotenv import load_dotenv
-
-from diffusers import DDPMScheduler
 
 from simple.dataset import StableDiffusionDataset
 
@@ -17,138 +23,183 @@ load_dotenv()
 DATA_DIR = os.getenv("DATA_DIR")
 CAPTIONS_FILE = os.getenv("CAPTIONS_FILE")
 
-scheduler = DDPMScheduler(
-    num_train_timesteps=1000,  # Standard for Stable Diffusion
-    beta_start=0.00085, 
-    beta_end=0.012, 
-    beta_schedule="scaled_linear",
-    clip_sample=True,
-)
+MODEL_NAME = "runwayml/stable-diffusion-v1-5"
+DTYPE = torch.float32
 
+LR = 5e-5
+BATCH_SIZE = 1
+EPOCHS = 400
 
-# 📌 Step 1: Load Stable Diffusion
-device = "mps" if torch.backends.mps.is_available() else "cpu"
-pipe = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5").to(device)
-
-# for some reason all my test images were flagged nsfw
-pipe.safety_checker = lambda images, clip_input: (images, [False])
-
-# 📌 Step 2: Apply LoRA to U-Net Cross-Attention
-lora_config = LoraConfig(
-    r=4,
-    lora_alpha=8,
-    lora_dropout=0.1,
-    target_modules=r"mid_block.attentions.*.transformer_blocks.*attn.*to_(q|k|v)" 
-   )
-pipe.unet = get_peft_model(pipe.unet, lora_config)
-
-pipe.unet.print_trainable_parameters()
-
-## Explicitly freeze non-lora layers
-for param in pipe.unet.parameters():
-    param.requires_grad = False  # Freeze everything
-
-for name, param in pipe.unet.named_parameters():
-    if "lora" in name:
-        param.requires_grad = True  # Only train LoRA
-
-
-# for name, param in pipe.unet.named_parameters():
-    # if "lora" in name:
-        # print(name, param.requires_grad)
-# exit()
-
-# 📌 Step 3: Load Dataset (Replace with Your Own)
-dataset = dataset = StableDiffusionDataset(image_dir=DATA_DIR, caption_file=CAPTIONS_FILE)
-
-train_data = [dataset.__getitem__(x) for x in range(9)]
-train_images, train_prompts = zip(*train_data)
-
-# 📌 Step 4: Define Optimizer
-optimizer = optim.Adam(pipe.unet.parameters(), lr=5e-5)
-
-# Define how often to generate test images (e.g., every 10 epochs)
 TEST_IMAGE_EVERY = 10
 TEST_PROMPT = "A cute sks dog sitting on a bed"
-
-# Directory to save test images
 TEST_IMAGE_DIR = "test_images"
+TEST_SEED = 42
+
+
+
+def encode_prompt(text_encocer, input_ids):
+    text_input_ids = input_ids.to(text_encoder.device)
+
+    prompt_embeds = text_encoder(
+        text_input_ids,
+        return_dict=False,
+    )
+
+    prompt_embeds = prompt_embeds[0]
+    return prompt_embeds
+
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+# load model components individually
+scheduler = DDPMScheduler.from_pretrained(
+        MODEL_NAME,
+        subfolder="scheduler",
+)
+tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        subfolder="tokenizer",
+        use_fast=False,
+)
+text_encoder = CLIPTextModel.from_pretrained(
+        MODEL_NAME,
+        subfolder="text_encoder"
+)
+vae = AutoencoderKL.from_pretrained(
+        MODEL_NAME,
+        subfolder="vae",
+)
+unet = UNet2DConditionModel.from_pretrained(
+        MODEL_NAME,
+        subfolder="unet",
+)
+
+# push to gpu
+unet.to(device, dtype=DTYPE)
+vae.to(device, dtype=DTYPE)
+text_encoder.to(device, dtype=DTYPE)
+
+# setup lora layers to target attention
+unet_lora_config = LoraConfig(
+    r=8,
+    lora_alpha=8,
+    init_lora_weights="gaussian",
+    target_modules=["to_k", "to_q", "to_v"]
+)
+unet.add_adapter(unet_lora_config)
+
+params_to_optimize = list(filter(lambda p: p.requires_grad, unet.parameters()))
+
+# uncomment to see trained layers
+# for name, param in unet.named_parameters():
+    # if param.requires_grad:
+        # print(name)
+
+optimizer = torch.optim.AdamW(
+        params_to_optimize,
+        lr=LR,
+)
+
+# for some reason all my test images were flagged nsfw
+# pipe.safety_checker = lambda images, clip_input: (images, [False])
+
+train_dataset = StableDiffusionDataset(
+    tokenizer=tokenizer,
+    image_dir=DATA_DIR,
+    caption_file=CAPTIONS_FILE
+)
+train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+)
+
+# Define how often to generate test images (e.g., every 10 epochs)
 os.makedirs(TEST_IMAGE_DIR, exist_ok=True)
 
+
 # 📌 Step 5: Training Loop
-epochs = 400
-batch_size = 1
+steps_per_epoch = len(train_dataset)  # I think this only works for batch size 1
+steps_for_scheduler = EPOCHS * steps_per_epoch
 
-for epoch in range(epochs):
-    epoch_loss = 0
+lr_scheduler = get_scheduler(
+    "constant",
+    optimizer=optimizer,
+    num_training_steps=steps_for_scheduler,
+)
 
-    for i in range(len(train_images) // batch_size):
+for epoch in range(EPOCHS):
+    unet.train()
+    
+    for step, batch in enumerate(train_dataloader):
+        # load pixel data
+        img = batch[0].to(device, DTYPE)
+        input = vae.encode(img).latent_dist.sample()
+        input = input * vae.config.scaling_factor
+        
+        # Sample noise
+        noise = torch.randn_like(input)
+        bsz, channels, height, width = input.shape
+
+        # Sample a random timestep from each image
+        timesteps = torch.randint(
+            0, scheduler.config.num_train_timesteps, (bsz,), device=device)
+        timesteps = timesteps.long()
+
+        noisy_input = scheduler.add_noise(input, noise, timesteps)
+
+        encoder_hidden_states = encode_prompt(
+            text_encoder,
+            batch[1]
+        )
+  
+        model_pred = unet(
+            noisy_input,
+            timesteps,
+            encoder_hidden_states,
+            return_dict=False
+        )[0]
+
+        target = noise
+
+        loss = F.mse_loss(model_pred, target, reduction="mean")
+        loss.backward()
+
+        optimizer.step()
+        lr_scheduler.step()
         optimizer.zero_grad()
 
-        # 📌 Select random image-prompt pair
-        idx = random.randint(0, len(train_images) - 1)
-        img = train_images[idx]
-        prompt = train_prompts[idx]
+        # print(f"loss: {loss.detach().item()} lr: {lr_scheduler.get_last_lr()[0]}")
 
-        # 📌 Encode Prompt
-        # 📌 Step 1: Tokenize Prompt
-        text_inputs = pipe.tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=77).to(device)
-
-        # 📌 Step 2: Get CLIP Text Embeddings
-        text_embeddings = pipe.text_encoder(text_inputs.input_ids)[0]  # Extract embeddings
-        
-        # 📌 Generate Noisy Latents
-        image_tensor = pipe.feature_extractor(img, return_tensors="pt").pixel_values.to(device)
-        latents = pipe.vae.encode(image_tensor).latent_dist.sample()
-        latents = latents * pipe.scheduler.init_noise_sigma
-
-        # 📌 Add Noise
-        noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, pipe.scheduler.config.num_train_timesteps, (1,), dtype=torch.long, device=device)
-
-        
-        alpha_prod_t = scheduler.alphas_cumprod.to(device)[timesteps].view(-1, 1, 1, 1)
-        noisy_latents = alpha_prod_t.sqrt() * latents + (1 - alpha_prod_t).sqrt() * noise
-        # noisy_latents = latents + noise
-        # noisy_latents = noisy_latents.to(torch.float32)
-    
-        # 📌 Predict Noise using U-Net
-        noise_pred = pipe.unet(noisy_latents, timesteps, text_embeddings).sample
-
-        # 📌 Compute Loss
-        loss = F.mse_loss(noise_pred, noise)
-        loss.backward()
-        optimizer.step()
-
-        epoch_loss += loss.item()
-
-    # ✅ Generate a test image every TEST_IMAGE_EVERY epochs
     if (epoch) % TEST_IMAGE_EVERY == 0:
-        print(f"Generating test image at epoch {epoch+1}...")
-        pipe.unet.eval()
-        # Generate image from the test prompt
-        with torch.no_grad():
-            image = pipe(TEST_PROMPT).images[0]  # Generate image
-            test_pred = pipe.unet(noisy_latents, timesteps, text_embeddings).sample
-            print("Noise Prediction Mean:", test_pred.mean().item())
-            print("Noise Prediction Std:", test_pred.std().item())
-       
-       # Save image
+        pipeline = DiffusionPipeline.from_pretrained(
+            MODEL_NAME,
+            unet=unet,
+            text_encoder=text_encoder,
+            torch_dtype=DTYPE
+        ).to(device, dtype=DTYPE)
+        generator = torch.Generator(device=device).manual_seed(TEST_SEED)
+        # with torch.amp.autocast(device):
+        image = pipeline(
+            prompt=TEST_PROMPT,
+            num_inference_steps=25,
+            generator=generator,
+        ).images[0]
         image_path = os.path.join(TEST_IMAGE_DIR, f"epoch_{epoch+1}.png")
         image.save(image_path)
-        pipe.unet.train()
+        del pipeline
+        free_memory()
 
-        print(f"✅ Test image saved to {image_path}")
 
-    print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss:.4f}")
+
+
 
 # 📌 Save LoRA Weights
-torch.save(pipe.unet.state_dict(), "lora_unet.pth")
+# torch.save(pipe.unet.state_dict(), "lora_unet.pth")
 
-# 📌 Test Inference
-pipe.unet.load_state_dict(torch.load("lora_unet.pth"))
-pipe.unet.eval()
-test_prompt = "A cute sks dog sitting in a park"
-image = pipe(test_prompt).images[0]
-image.save("lora_output.png")
+# # 📌 Test Inference
+# pipe.unet.load_state_dict(torch.load("lora_unet.pth"))
+# pipe.unet.eval()
+# test_prompt = "A cute sks dog sitting in a park"
+# image = pipe(test_prompt).images[0]
+# image.save("lora_output.png")
 
