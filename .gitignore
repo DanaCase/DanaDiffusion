@@ -16,3 +16,6 @@ my_lora_weights/
 
 # Mac
 .DS_Store
+
+# Env
+.env
