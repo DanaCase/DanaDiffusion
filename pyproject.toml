@@ -1,0 +1,13 @@
+[project]
+name = "DanaDiffusion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.3.2",
+    "dotenv>=0.9.9",
+    "ipykernel>=6.29.5",
+    "peft>=0.14.0",
+    "perfusion-pytorch>=0.1.23",
+]
