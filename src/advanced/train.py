@@ -62,12 +62,21 @@ DTYPE = torch.float32
 LR = 5e-5
 BATCH_SIZE = 1
 EPOCHS = 400
+ADAM_WEIGHT_DECAY = 1e-04
+EPS = 1e-08
+
+ADAM_WDECAY_TEXT_ENCODER = 1e-03
+TEXT_ENCODER_LR = 5e-6 
+
+B1 = 0.9
+B2 = 0.999
 
 TEST_IMAGE_EVERY = 10
 TEST_PROMPT = "A cute sks dog sitting on a bed"
 TEST_IMAGE_DIR = "test_images"
 TEST_SEED = 42
 
+TRAIN_TEXT_ENCODER_TI_FRAC=0.5
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -206,6 +215,12 @@ transformer = FluxTransformer2DModel.from_pretrained(
         subfolder="transformer",
 )
 
+# dont trian by default
+transformer.requires_grad_(False)
+vae.requires_grad_(False)
+text_encoder1.requires_grad_(False)
+text_encoder2.requires_grad_(False)
+
 # push to gpu
 transformer.to(device, dtype=DTYPE)
 vae.to(device, dtype=DTYPE)
@@ -217,16 +232,55 @@ transformer_lora_config = LoraConfig(
     r=8,
     lora_alpha=8,
     init_lora_weights="gaussian",
-    target_modules=["to_k", "to_q", "to_v"]
+    target_modules=[
+            "attn.to_k",
+            "attn.to_q",
+            "attn.to_v",
+            "attn.to_out.0",
+            "attn.add_k_proj",
+            "attn.add_q_proj",
+            "attn.add_v_proj",
+            "attn.to_add_out",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
+        ]
 )
 transformer.add_adapter(transformer_lora_config)
+transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+
+# setup text encoder training
+text_lora_config = LoraConfig(
+        r=8,
+        lora_alpha=8,
+        init_lora_weights="gaussian",
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+text_encoder1.add_adapter(text_lora_config)
+text_lora_parameters1 = list(filter(lambda p: p.requires_grad, text_encoder1.parameters()))
+
+# Set up the optimizer
+transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": LR}
+text_parameters_one_with_lr = {
+            "params": text_lora_parameters1,
+            "weight_decay": ADAM_WDECAY_TEXT_ENCODER,
+            "lr": TEXT_ENCODER_LR,
+        }
+params_to_optimize = [transformer_parameters_with_lr, text_parameters_one_with_lr]
+
+optimizer_class = torch.optim.AdamW
+optimizer = optimizer_class(
+    params_to_optimize,
+    betas=(B1, B2),
+    weight_decay=ADAM_WEIGHT_DECAY,
+    eps=EPS,
+)
 
 def log_validation():
     # going to need to get both text encoders in there
-        pipeline = DiffusionPipeline.from_pretrained(
+        pipeline = FluxPipeline.from_pretrained(
             MODEL_NAME,
-            unet=unet,
-            text_encoder=text_encoder1,
             torch_dtype=DTYPE
         ).to(device, dtype=DTYPE)
         generator = torch.Generator(device=device).manual_seed(TEST_SEED)
@@ -489,3 +543,5 @@ def encode_prompt(
     text_ids = text_ids.repeat(num_images_per_prompt, 1, 1)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
+
+
