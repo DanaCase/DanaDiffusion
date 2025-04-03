@@ -13,3 +13,15 @@ dependencies = [
     "perfusion-pytorch>=0.1.23",
     "transformers>=4.49.0",
 ]
+
+[tool.pixi.project]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+DanaDiffusion = { path = ".", editable = true }
+
+[tool.pixi.dependencies]
+sentencepiece = ">=0.2.0,<0.3"
+protobuf = ">=5.29.3,<6"
+

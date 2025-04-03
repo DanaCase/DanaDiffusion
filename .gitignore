@@ -19,3 +19,7 @@ my_lora_weights/
 
 # Env
 .env
+
+# pixi environments
+.pixi
+*.egg-info
