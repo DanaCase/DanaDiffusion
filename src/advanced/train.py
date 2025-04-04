@@ -1,6 +1,8 @@
-from typing import List, Optional, Union
+from typing import Any, Dict, Optional, Union, List
 import copy
-
+import re
+import math
+import itertools
 import transformers
 import torch
 import torch.nn.functional as F
@@ -50,7 +52,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 from dotenv import load_dotenv
 import os
 
-from simple.dataset import StableDiffusionDataset
+from advanced.dataset import StableDiffusionDataset
 
 load_dotenv()
 DATA_DIR = os.getenv("DATA_DIR")
@@ -60,13 +62,26 @@ MODEL_NAME = "black-forest-labs/FLUX.1-dev"
 DTYPE = torch.float32
 
 LR = 5e-5
+LRSCHEDULER = "constant"
+LRWARMUP_STEPS = 500
+LR_CYCLES = 1
+LR_POWER = 1.0
 BATCH_SIZE = 1
 EPOCHS = 400
 ADAM_WEIGHT_DECAY = 1e-04
 EPS = 1e-08
 
+WEIGHTING_SCHEME = None
+GUIDANCE_SCALE = 3.5
+MAX_GRAD_NORM = 1
+
 ADAM_WDECAY_TEXT_ENCODER = 1e-03
-TEXT_ENCODER_LR = 5e-6 
+TEXT_ENCODER_LR = 5e-6
+INITALIZER_CONCEPT = 'a dog'
+TRAIN_TEXT_ENCODER_TI_FRAC = 0.5
+TOKEN_ABSTRACTION = "sks"
+INSTANCE_PROMPT = "photo of an sks dog"
+MAX_PROMPT_LENGTH = 512 
 
 B1 = 0.9
 B2 = 0.999
@@ -76,7 +91,6 @@ TEST_PROMPT = "A cute sks dog sitting on a bed"
 TEST_IMAGE_DIR = "test_images"
 TEST_SEED = 42
 
-TRAIN_TEXT_ENCODER_TI_FRAC=0.5
 
 device = "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -215,6 +229,7 @@ transformer = FluxTransformer2DModel.from_pretrained(
         subfolder="transformer",
 )
 
+
 # dont trian by default
 transformer.requires_grad_(False)
 vae.requires_grad_(False)
@@ -251,48 +266,27 @@ transformer.add_adapter(transformer_lora_config)
 transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
 
 # setup text encoder training
-text_lora_config = LoraConfig(
-        r=8,
-        lora_alpha=8,
-        init_lora_weights="gaussian",
-        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
-        )
-text_encoder1.add_adapter(text_lora_config)
-text_lora_parameters1 = list(filter(lambda p: p.requires_grad, text_encoder1.parameters()))
+# pivotal tuning training only CLIP for now
+token_abstraction_list = [placeholder.strip() for placeholder in re.split(r",\s*", TOKEN_ABSTRACTION)]
+print(f"list of token identifiers: {token_abstraction_list}")
+token_ids = tokenizer1.encode(INITALIZER_CONCEPT, add_special_tokens=False)
+num_new_tokens_per_abstraction = len(token_ids)
 
-# Set up the optimizer
-transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": LR}
-text_parameters_one_with_lr = {
-            "params": text_lora_parameters1,
-            "weight_decay": ADAM_WDECAY_TEXT_ENCODER,
-            "lr": TEXT_ENCODER_LR,
-        }
-params_to_optimize = [transformer_parameters_with_lr, text_parameters_one_with_lr]
+token_abstraction_dict = {}
+token_idx = 0
+for i, token in enumerate(token_abstraction_list):
+    token_abstraction_dict[token] = [f"<s{token_idx + i + j}>" for j in range(num_new_tokens_per_abstraction)]
+    token_idx += num_new_tokens_per_abstraction - 1
 
-optimizer_class = torch.optim.AdamW
-optimizer = optimizer_class(
-    params_to_optimize,
-    betas=(B1, B2),
-    weight_decay=ADAM_WEIGHT_DECAY,
-    eps=EPS,
-)
+for token_abs, token_replacement in token_abstraction_dict.items():
+    new_instance_prompt = INSTANCE_PROMPT.replace(token_abs, "".join(token_replacement))
 
-def log_validation():
-    # going to need to get both text encoders in there
-        pipeline = FluxPipeline.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=DTYPE
-        ).to(device, dtype=DTYPE)
-        generator = torch.Generator(device=device).manual_seed(TEST_SEED)
-        image = pipeline(
-            prompt=TEST_PROMPT,
-            num_inference_steps=25,
-            generator=generator,
-        ).images[0]
-        image_path = os.path.join(TEST_IMAGE_DIR, f"epoch_{epoch+1}.png")
-        image.save(image_path)
-        del pipeline
-        free_memory()
+validation_prompt = TEST_PROMPT.replace(token_abs, "".join(token_replacement))
+
+text_encoders = [text_encoder1, text_encoder2]
+tokenizers = [tokenizer1, tokenizer2]
+
+
 
 class TokenEmbeddingsHandler:
     def __init__(self, text_encoders, tokenizers):
@@ -391,6 +385,7 @@ class TokenEmbeddingsHandler:
         return self.text_encoders[0].device
 
     def retract_embeddings(self):
+        print(self.text_encoders)
         for idx, text_encoder in enumerate(self.text_encoders):
             embeds = text_encoder.text_model.embeddings.token_embedding if idx == 0 else text_encoder.shared
             index_no_updates = self.embeddings_settings[f"index_no_updates_{idx}"]
@@ -410,6 +405,77 @@ class TokenEmbeddingsHandler:
 
             new_embeddings = new_embeddings * (off_ratio**0.1)
             embeds.weight.data[index_updates] = new_embeddings
+
+
+embedding_handler = TokenEmbeddingsHandler(text_encoders, tokenizers)
+inserting_toks = []
+for new_tok in token_abstraction_dict.values():
+    inserting_toks.extend(new_tok)
+embedding_handler.initialize_new_tokens(inserting_toks=inserting_toks)
+
+
+text_lora_config = LoraConfig(
+        r=8,
+        lora_alpha=8,
+        init_lora_weights="gaussian",
+        target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],
+        )
+text_encoder1.add_adapter(text_lora_config)
+
+text_lora_parameters_one = []
+for name, param in text_encoder1.named_parameters():
+    if "token_embedding" in name:
+        param.data = param.to(dtype=torch.float32)
+        param.requires_grad = True
+        text_lora_parameters_one.append(param)
+    else:
+        param.requires_grad = False
+
+
+# Set up the optimizer
+transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": LR}
+text_parameters_one_with_lr = {
+            "params": text_lora_parameters_one,
+            "weight_decay": ADAM_WDECAY_TEXT_ENCODER,
+            "lr": TEXT_ENCODER_LR,
+        }
+params_to_optimize = [transformer_parameters_with_lr, text_parameters_one_with_lr]
+te_idx = 1
+
+optimizer_class = torch.optim.AdamW
+optimizer = optimizer_class(
+    params_to_optimize,
+    betas=(B1, B2),
+    weight_decay=ADAM_WEIGHT_DECAY,
+    eps=EPS,
+)
+
+add_special_tokens_clip = True
+add_special_tokens_t5 = False
+
+vae_config_shift_factor = vae.config.shift_factor
+vae_config_scaling_factor = vae.config.scaling_factor
+vae_config_block_out_channels = vae.config.block_out_channels
+
+weight_dtype = torch.float32
+
+
+def log_validation(
+    pipeline,
+    pipeline_args,
+    epoch,
+    is_final_validation=False
+):
+    pipeline = pipeline.to(device, dtype=DTYPE)
+    generator = torch.Generator(device=device).manual_seed(TEST_SEED)
+    image = pipeline(
+        prompt=TEST_PROMPT,
+        num_inference_steps=25,
+        generator=generator,
+    ).images[0]
+    image_path = os.path.join(TEST_IMAGE_DIR, f"epoch_{epoch+1}.png")
+    image.save(image_path)
+
 
 
 def tokenize_prompt(tokenizer, prompt, max_sequence_length, add_special_tokens=False):
@@ -545,3 +611,218 @@ def encode_prompt(
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
 
+train_dataset = StableDiffusionDataset(
+    image_dir=DATA_DIR,
+    caption_file=CAPTIONS_FILE,
+    train_text_encoder_ti=True,
+    instance_prompt=new_instance_prompt,
+    token_abstraction_dict=token_abstraction_dict,
+)
+train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+)
+
+num_update_steps_per_epoch = math.ceil(len(train_dataloader) / 1)
+max_training_steps = EPOCHS * num_update_steps_per_epoch
+
+num_train_epochs_text_encoder = int(TRAIN_TEXT_ENCODER_TI_FRAC  * EPOCHS)
+num_train_epochs_transformer = int(EPOCHS)
+
+
+lr_scheduler = get_scheduler(
+    LRSCHEDULER,
+    optimizer=optimizer,
+    num_warmup_steps=LRWARMUP_STEPS,
+    num_training_steps=max_training_steps,
+    num_cycles=LR_CYCLES,
+    power=LR_POWER,
+)
+
+print("Training")
+print(f"Num examples = {len(train_dataset)}")
+print(f"Num batches = {len(train_dataloader)}")
+print(f"Num epochs = {EPOCHS}")
+print(f"Total optimization steps = {max_training_steps}")
+
+global_step = 0
+first_epoch = 0
+
+progress_bar = tqdm(
+    range(0, max_training_steps),
+    initial=global_step,
+    desc="Steps",
+)
+def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+    sigmas = noise_scheduler_copy.sigmas.to(device=device, dtype=DTYPE)
+    schedule_timesteps = noise_scheduler_copy.timesteps.to(device)
+    timesteps = timesteps.to(device)
+    step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+    sigma = sigmas[step_indices].flatten()
+    while len(sigma.shape) < n_dim:
+        sigma = sigma.unsqueeze(-1)
+    return sigma
+
+
+pivoted_te = False
+pivoted_tr = False
+for epoch in range(first_epoch, EPOCHS):
+    transformer.train()
+    
+    if epoch == num_train_epochs_text_encoder:
+       print(f"PIVOT TE {epoch}")
+       pivoted_te = True
+    else:
+       text_encoder1.train()
+    
+    if epoch == num_train_epochs_transformer:
+        print(f"PIVOT TRANSFORMER {epoch}")
+        pivoted_tr = True
+
+    for step, batch in enumerate(train_dataloader):
+        if pivoted_te:
+            optimizer.param_groups[te_idx]["lr"] = 0.0
+            optimizer.param_groups[-1]["lr"] = 0.0
+        elif pivoted_tr:
+            optimizer.param_groups[0]["lr"] = 0.0
+
+        prompts = batch[1]
+        elems_to_repeat = 1
+
+        # CLIP has max lenght of 77
+        tokens_one = tokenize_prompt(
+                tokenizer1,
+                prompts,
+                max_sequence_length=77,
+                add_special_tokens=add_special_tokens_clip,
+        )
+        tokens_two = tokenize_prompt(
+                tokenizer2,
+                prompts,
+                max_sequence_length=MAX_PROMPT_LENGTH,
+                add_special_tokens=add_special_tokens_t5,
+        )
+        
+        prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
+            text_encoders=[text_encoder1, text_encoder2],
+            tokenizers=[None, None],
+            text_input_ids_list=[
+                tokens_one.repeat(elems_to_repeat, 1),
+                tokens_two.repeat(elems_to_repeat, 1),
+            ],
+            max_sequence_length=MAX_PROMPT_LENGTH,
+            device=device,
+            prompt=prompts,
+        )
+        
+        pixel_values = batch[0].to(device, dtype=vae.dtype)
+        model_input = vae.encode(pixel_values).latent_dist.sample()
+
+        model_input = (model_input - vae_config_shift_factor) * vae_config_scaling_factor
+        model_input = model_input.to(dtype=weight_dtype)
+
+        vae_scale_factor = 2 ** (len(vae_config_block_out_channels))
+
+        latent_image_ids = FluxPipeline._prepare_latent_image_ids(
+            model_input.shape[0],
+            model_input.shape[2] // 2,
+            model_input.shape[3] // 2,
+            device,
+            weight_dtype
+        )
+
+        noise = torch.randn_like(model_input)
+        bsz = model_input.shape[0]
+
+        u = compute_density_for_timestep_sampling(
+            weighting_scheme = WEIGHTING_SCHEME,
+            batch_size=bsz
+        )
+        indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+        timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+
+        sigmas = get_sigmas(timesteps, n_dim=model_input.dim(), dtype=model_input.dtype)
+        noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+
+        packed_noisy_model_input = FluxPipeline._pack_latents(
+            noisy_model_input,
+            batch_size=model_input.shape[0],
+            num_channels_latents=model_input.shape[1],
+            height=model_input.shape[2],
+            width=model_input.shape[3]
+        )
+
+        guidance = torch.tensor([GUIDANCE_SCALE], device=device)
+        guidance = guidance.expand(model_input.shape[0])
+
+        print(type(transformer.time_text_embed))
+        print(transformer.time_text_embed.forward.__code__.co_varnames)
+
+        model_pred = transformer(
+            hidden_states=packed_noisy_model_input,
+            timestep = timesteps / 1000,
+            guidance=guidance,
+            pooled_projections = pooled_prompt_embeds,
+            encoder_hidden_states=prompt_embeds,
+            txt_ids=text_ids,
+            img_ids=latent_image_ids,
+            return_dict=False,
+        )[0]
+
+        model_pred = FluxPipeline._unpack_latents(
+            model_pred,
+            height=model_input.shape[2] * vae_scale_factor,
+            width=model_input.shape[3] * vae_scale_factor,
+            vae_scale_factor=vae_scale_factor,
+        )
+
+        weighting = compute_loss_weighting_for_sd3(weighting_scheme=WEIGHTING_SCHEME, sigmas=sigmas)
+
+        # flow matching loss
+        target = noise - model_input
+
+        loss = torch.mean(
+            (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+            1,
+        )
+        loss = loss.mean()
+        loss.backward()
+
+        params_to_clip = itertools.chain(transformer.parameters(), text_encoder1.parameters())
+        torch.nn.utils.clip_grad_norm_(params_to_clip, MAX_GRAD_NORM)
+
+        optimizer.step()
+        lr_scheduler.step()
+        optimizer.zero_grad()
+        
+        embedding_handler.retract_embeddings()
+
+        progress_bar.update(1)
+        global_step += 1
+        
+        print(f"loss {loss.detach().item()}")
+
+        if global_step >= max_training_steps:
+            break
+
+        if epoch % TEST_IMAGE_EVERY == 0:
+            pipeline = FluxPipeline.from_pretrained(
+                MODEL_NAME,
+                vae=vae,
+                text_encoder=text_encoder1,
+                text_endoder_2=text_encoder2,
+                transformer=transformer,
+                torch_dtype=weight_dtype,
+            )
+
+            pipeline_args = {"prompt": TEST_PROMPT}
+            images = log_validation(
+                pipeline=pipeline,
+                pipeline_args=pipeline_args,
+                epoch=epoch,
+            )
+            images = None
+            del pipeline
+            del text_encoder2
+            free_memory()
