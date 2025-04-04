@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, optim
 
+from pathlib import Path
 from peft import LoraConfig, set_peft_model_state_dict
 from peft.utils import get_peft_model_state_dict
 from PIL import Image
@@ -85,6 +86,9 @@ MAX_PROMPT_LENGTH = 512
 
 B1 = 0.9
 B2 = 0.999
+
+CHECKPOINTING_STEPS = 500
+CHECKPOINT_DIR = "checkpoints"
 
 TEST_IMAGE_EVERY = 10
 TEST_PROMPT = "A cute sks dog sitting on a bed"
@@ -283,7 +287,7 @@ for token_abs, token_replacement in token_abstraction_dict.items():
 
 validation_prompt = TEST_PROMPT.replace(token_abs, "".join(token_replacement))
 
-text_encoders = [text_encoder1, text_encoder2]
+text_encoders = [text_encoder1]
 tokenizers = [tokenizer1, tokenizer2]
 
 
@@ -325,7 +329,7 @@ class TokenEmbeddingsHandler:
             )
             std_token_embedding = embeds.weight.data.std()
 
-            print(f"{idx} text encoder's std_token_embedding: {std_token_embedding}")
+            # print(f"{idx} text encoder's std_token_embedding: {std_token_embedding}")
 
             train_ids = self.train_ids if idx == 0 else self.train_ids_t5
             # if initializer_concept are not provided, token embeddings are initialized randomly
@@ -354,7 +358,7 @@ class TokenEmbeddingsHandler:
 
             self.embeddings_settings[f"index_no_updates_{idx}"] = index_no_updates
 
-            print(self.embeddings_settings[f"index_no_updates_{idx}"].shape)
+            # print(self.embeddings_settings[f"index_no_updates_{idx}"].shape)
 
             idx += 1
 
@@ -385,7 +389,7 @@ class TokenEmbeddingsHandler:
         return self.text_encoders[0].device
 
     def retract_embeddings(self):
-        print(self.text_encoders)
+        # print(self.text_encoders)
         for idx, text_encoder in enumerate(self.text_encoders):
             embeds = text_encoder.text_model.embeddings.token_embedding if idx == 0 else text_encoder.shared
             index_no_updates = self.embeddings_settings[f"index_no_updates_{idx}"]
@@ -412,6 +416,18 @@ inserting_toks = []
 for new_tok in token_abstraction_dict.values():
     inserting_toks.extend(new_tok)
 embedding_handler.initialize_new_tokens(inserting_toks=inserting_toks)
+
+
+def save_checkpoint(transformer, text_encoder, output_dir):
+    transformer_lora_weights = get_peft_model_state_dict(transformer)
+    text_encoder_lora_weights = get_peft_model_state_dict(text_encoder)
+
+    FluxPipeline.save_lora_weights(
+        output_dir,
+        transformer_lora_layers=transformer_lora_weights,
+        text_encoder_lora_layers=text_encoder_lora_weights
+    )
+    embedding_handler.save_embeddings(f"{output_dir}/{Path(output_dir).name}_emb.safetensors")
 
 
 text_lora_config = LoraConfig(
@@ -494,8 +510,8 @@ def tokenize_prompt(tokenizer, prompt, max_sequence_length, add_special_tokens=F
 
 
 def _get_t5_prompt_embeds(
-    text_encoder,
     tokenizer,
+    text_encoder,
     max_sequence_length=512,
     prompt=None,
     num_images_per_prompt=1,
@@ -703,7 +719,6 @@ for epoch in range(first_epoch, EPOCHS):
                 max_sequence_length=MAX_PROMPT_LENGTH,
                 add_special_tokens=add_special_tokens_t5,
         )
-        
         prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
             text_encoders=[text_encoder1, text_encoder2],
             tokenizers=[None, None],
@@ -756,9 +771,6 @@ for epoch in range(first_epoch, EPOCHS):
         guidance = torch.tensor([GUIDANCE_SCALE], device=device)
         guidance = guidance.expand(model_input.shape[0])
 
-        print(type(transformer.time_text_embed))
-        print(transformer.time_text_embed.forward.__code__.co_varnames)
-
         model_pred = transformer(
             hidden_states=packed_noisy_model_input,
             timestep = timesteps / 1000,
@@ -798,31 +810,37 @@ for epoch in range(first_epoch, EPOCHS):
         
         embedding_handler.retract_embeddings()
 
+        if global_step % CHECKPOINTING_STEPS == 0:
+            save_path = os.path.join(CHECKPOINT_DIR, f"checkpoint-{global_step}")
+            save_checkpoint(transformer, text_encoder1, save_path)
+            
+        print(f"loss {loss.detach().item()}")
         progress_bar.update(1)
         global_step += 1
-        
-        print(f"loss {loss.detach().item()}")
 
         if global_step >= max_training_steps:
             break
 
-        if epoch % TEST_IMAGE_EVERY == 0:
-            pipeline = FluxPipeline.from_pretrained(
-                MODEL_NAME,
-                vae=vae,
-                text_encoder=text_encoder1,
-                text_endoder_2=text_encoder2,
-                transformer=transformer,
-                torch_dtype=weight_dtype,
-            )
+    if epoch % TEST_IMAGE_EVERY == 0:
+        pipeline = FluxPipeline.from_pretrained(
+            MODEL_NAME,
+            vae=vae,
+            text_encoder=text_encoder1,
+            text_encoder_2=text_encoder2,
+            transformer=transformer,
+            torch_dtype=weight_dtype,
+        )
 
-            pipeline_args = {"prompt": TEST_PROMPT}
-            images = log_validation(
-                pipeline=pipeline,
-                pipeline_args=pipeline_args,
-                epoch=epoch,
-            )
-            images = None
-            del pipeline
-            del text_encoder2
-            free_memory()
+        pipeline_args = {"prompt": TEST_PROMPT}
+        images = log_validation(
+            pipeline=pipeline,
+            pipeline_args=pipeline_args,
+            epoch=epoch,
+        )
+        images = None
+        del pipeline
+        free_memory()
+
+save_path = os.path.join(CHECKPOINT_DIR, f"checkpoint-{global_step}")
+save_checkpoint(transformer, text_encoder1, save_path)
+
